@@ -29,7 +29,11 @@ omarchy-launch-screensaver [force] [options]
 
 ## Build and test
 
-Building needs Rust, `pkg-config` and libxkbcommon. Running it needs a compositor with `wlr-layer-shell`, such as Hyprland, and a monospace font: JetBrains Mono Nerd Font, or the closest monospace font `fc-match` finds.
+Building needs Rust, `pkg-config` and libxkbcommon. Running it needs a compositor with `wlr-layer-shell`, such as Hyprland, and a monospace font: Monaspace Neon NF, or the closest monospace font `fc-match` finds.
+
+Missing glyphs use Fontconfig-selected fallback fonts. Fonts and glyph bitmaps are cached; cell dimensions and baseline remain those of the primary font. If no installed font supports a character, rendering reports an error.
+
+Rendering alternates between reusable buffers so animation continues on compositors that retain the displayed buffer until its replacement arrives.
 
 ```bash
 make                                  # build/rust/release/omarchy-launch-screensaver

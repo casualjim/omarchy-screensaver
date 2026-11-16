@@ -76,6 +76,9 @@ struct OutputSurface {
     buffer_size: (i32, i32),
     rendered_cells: Vec<Cell>,
     rendered_grid: (i32, i32),
+    spare_buffer: Option<Buffer>,
+    spare_rendered_cells: Vec<Cell>,
+    spare_rendered_grid: (i32, i32),
     opaque_region: Option<(i32, i32)>,
 }
 
@@ -203,6 +206,9 @@ impl App {
             buffer_size: (0, 0),
             rendered_cells: Vec::new(),
             rendered_grid: (0, 0),
+            spare_buffer: None,
+            spare_rendered_cells: Vec::new(),
+            spare_rendered_grid: (0, 0),
             opaque_region: None,
         });
     }
@@ -367,8 +373,26 @@ fn present_surface(
     let stride = width * 4;
     if surface.buffer_size != (width, height) {
         surface.buffer = None;
+        surface.spare_buffer = None;
+        surface.spare_rendered_cells.clear();
         surface.buffer_size = (width, height);
         surface.rendered_cells.clear();
+    }
+    if surface
+        .buffer
+        .as_ref()
+        .is_some_and(|buffer| pool.canvas(buffer).is_none())
+    {
+        // The compositor may retain the displayed buffer until its replacement arrives.
+        std::mem::swap(&mut surface.buffer, &mut surface.spare_buffer);
+        std::mem::swap(
+            &mut surface.rendered_cells,
+            &mut surface.spare_rendered_cells,
+        );
+        std::mem::swap(
+            &mut surface.rendered_grid,
+            &mut surface.spare_rendered_grid,
+        );
     }
 
     let damage = if surface.buffer.is_none() {
@@ -501,6 +525,8 @@ impl CompositorHandler for App {
             output.scale = factor.max(1);
             output.layer.wl_surface().set_buffer_scale(output.scale);
             output.buffer = None;
+            output.spare_buffer = None;
+            output.spare_rendered_cells.clear();
             output.rendered_cells.clear();
             output.dirty = true;
         }

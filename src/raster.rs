@@ -1,4 +1,9 @@
-use std::{collections::HashMap, env, fs, path::PathBuf, process::Command};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context, Result, anyhow};
 use fontdue::{Font, FontSettings, Metrics};
@@ -22,6 +27,7 @@ pub struct Damage {
 
 pub struct Rasterizer {
     font: Font,
+    fallback_fonts: Vec<Font>,
     glyphs: HashMap<(char, i32), Glyph>,
     cell_width: i32,
     cell_height: i32,
@@ -31,17 +37,7 @@ pub struct Rasterizer {
 impl Rasterizer {
     pub fn load() -> Result<Self> {
         let path = resolve_monospace_font()?;
-        let data = fs::read(&path)
-            .with_context(|| format!("cannot read monospace font {}", path.display()))?;
-        let font = Font::from_bytes(
-            data,
-            FontSettings {
-                scale: FONT_PX,
-                load_substitutions: false,
-                ..FontSettings::default()
-            },
-        )
-        .map_err(|error| anyhow!("cannot parse monospace font {}: {error}", path.display()))?;
+        let font = load_font(&path)?;
         let line = font
             .horizontal_line_metrics(FONT_PX)
             .context("selected font has no horizontal metrics")?;
@@ -50,6 +46,7 @@ impl Rasterizer {
         let ascent = line.ascent.ceil() as i32;
         Ok(Self {
             font,
+            fallback_fonts: Vec::new(),
             glyphs: HashMap::new(),
             cell_width,
             cell_height,
@@ -80,7 +77,7 @@ impl Rasterizer {
         fill_rect(pixels, width, height, 0, 0, width, height, [0; 3], 255);
         self.draw_region(
             pixels, width, height, cells, cols, rows, 255, scale, 0, cols, 0, rows,
-        );
+        )?;
         Ok(())
     }
 
@@ -139,7 +136,7 @@ impl Rasterizer {
         self.draw_region(
             pixels, width, height, cells, cols, rows, 255, scale, col_start, col_end, row_start,
             row_end,
-        );
+        )?;
         Ok(Some(Damage {
             x: x0,
             y: y0,
@@ -163,7 +160,7 @@ impl Rasterizer {
         col_end: i32,
         row_start: i32,
         row_end: i32,
-    ) {
+    ) -> Result<()> {
         let scale = scale.max(1);
         let cell_width = self.cell_width * scale;
         let cell_height = self.cell_height * scale;
@@ -207,11 +204,18 @@ impl Rasterizer {
                     continue;
                 }
                 let key = (cell.ch, scale);
-                let font = &self.font;
-                let glyph = self.glyphs.entry(key).or_insert_with(|| {
-                    let (metrics, coverage) = font.rasterize(cell.ch, FONT_PX * scale as f32);
-                    Glyph { metrics, coverage }
-                });
+                let glyph = match self.glyphs.entry(key) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        let font = if self.font.chars().contains_key(&cell.ch) {
+                            &self.font
+                        } else {
+                            fallback_font(&mut self.fallback_fonts, cell.ch)?
+                        };
+                        let (metrics, coverage) = font.rasterize(cell.ch, FONT_PX * scale as f32);
+                        entry.insert(Glyph { metrics, coverage })
+                    }
+                };
                 let glyph_x = x + glyph.metrics.xmin;
                 let baseline = y + self.ascent * scale;
                 let glyph_y = baseline - glyph.metrics.ymin - glyph.metrics.height as i32;
@@ -232,15 +236,51 @@ impl Rasterizer {
                 );
             }
         }
+        Ok(())
     }
+}
+
+fn load_font(path: &Path) -> Result<Font> {
+    let data = fs::read(path)
+        .with_context(|| format!("cannot read font {}", path.display()))?;
+    Font::from_bytes(
+        data,
+        FontSettings {
+            scale: FONT_PX,
+            load_substitutions: false,
+            ..FontSettings::default()
+        },
+    )
+    .map_err(|error| anyhow!("cannot parse font {}: {error}", path.display()))
+}
+
+fn fallback_font(fonts: &mut Vec<Font>, ch: char) -> Result<&Font> {
+    if let Some(index) = fonts.iter().position(|font| font.chars().contains_key(&ch)) {
+        return Ok(&fonts[index]);
+    }
+    let output = Command::new("fc-match")
+        .args(["-f", "%{file}\n", &format!("Monaspace Neon NF:charset={:x}", ch as u32)])
+        .output()
+        .context("cannot locate fallback font: fc-match failed")?;
+    if !output.status.success() {
+        return Err(anyhow!("fc-match failed for U+{:04X}", ch as u32));
+    }
+    let path = String::from_utf8(output.stdout)
+        .context("fc-match returned a non-UTF-8 font path")?;
+    let font = load_font(Path::new(path.lines().next().unwrap_or_default()))?;
+    if !font.chars().contains_key(&ch) {
+        return Err(anyhow!("no installed font supports U+{:04X}", ch as u32));
+    }
+    fonts.push(font);
+    Ok(fonts.last().expect("fallback font was inserted"))
 }
 fn resolve_monospace_font() -> Result<PathBuf> {
     let mut candidates = vec![PathBuf::from(
-        "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+        "/usr/share/fonts/OTF/MonaspaceNeonNF-Regular.otf",
     )];
     if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".local/share/fonts/JetBrainsMonoNerdFont-Regular.ttf"));
-        candidates.push(home.join(".fonts/JetBrainsMonoNerdFont-Regular.ttf"));
+        candidates.push(home.join(".local/share/fonts/MonaspaceNeonNF-Regular.otf"));
+        candidates.push(home.join(".fonts/MonaspaceNeonNF-Regular.otf"));
     }
     if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
         return Ok(path);
@@ -249,7 +289,7 @@ fn resolve_monospace_font() -> Result<PathBuf> {
         .args([
             "-f",
             "%{file}\n",
-            "JetBrainsMono Nerd Font,JetBrains Mono,monospace:style=Regular",
+            "Monaspace Neon NF,monospace:style=Regular",
         ])
         .output()
         .context("cannot locate a monospace font: fc-match failed")?;
